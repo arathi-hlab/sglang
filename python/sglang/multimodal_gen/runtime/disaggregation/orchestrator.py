@@ -63,6 +63,7 @@ def _deserialize_request_metrics(data: dict | None) -> RequestMetrics | None:
     metrics = RequestMetrics(request_id=data["request_id"])
     metrics.stages = data.get("stages", {})
     metrics.steps = data.get("steps", [])
+    metrics.device_steps = data.get("device_steps", [])
     metrics.total_duration_ms = data.get("total_duration_ms", 0.0)
     for name, snapshot in data.get("memory_snapshots", {}).items():
         metrics.memory_snapshots[name] = MemorySnapshot(

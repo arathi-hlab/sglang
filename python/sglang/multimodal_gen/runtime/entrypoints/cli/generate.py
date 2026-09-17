@@ -127,6 +127,7 @@ def maybe_dump_performance(
     metrics = RequestMetrics(request_id=metrics_dict.get("request_id"))
     metrics.stages = metrics_dict.get("stages", {})
     metrics.steps = metrics_dict.get("steps", [])
+    metrics.device_steps = metrics_dict.get("device_steps", [])
     metrics.total_duration_ms = metrics_dict.get("total_duration_ms", 0)
 
     # restore memory snapshots from serialized dict

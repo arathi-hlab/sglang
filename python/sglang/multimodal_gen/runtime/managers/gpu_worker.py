@@ -708,6 +708,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             duration_ms = (time.monotonic() - start_time) * 1000
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
+                metrics.resolve_device_timings()
 
             req_label = req.request_id[:8] if req.request_id else "unnamed"
             with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):

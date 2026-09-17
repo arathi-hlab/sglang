@@ -58,6 +58,10 @@ class RequestMetrics:
         self.request_id = request_id
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
+        # Device-event step timings, filled by resolve_device_timings(). Either
+        # empty or index-aligned with self.steps; consumers must check the length.
+        self.device_steps: list[float] = []
+        self._pending_step_events: list[tuple[Any, Any]] = []
         self.steps_by_stage: Dict[str, list[float]] = {}
         self.stage_iterations: Dict[str, tuple[int, int]] = {}
         self.active_stage_name: str | None = None
@@ -87,6 +91,33 @@ class RequestMetrics:
                 duration_ms
             )
 
+    def record_step_device_events(self, start_event: Any, end_event: Any) -> None:
+        """Queue a step's recorded device events; read back at request end."""
+        if self.suppress_stage_breakdown:
+            return
+        self._pending_step_events.append((start_event, end_event))
+
+    def resolve_device_timings(self) -> None:
+        """Read queued device events into device_steps; call once per request.
+
+        Deferred to request end so reading a timing never drains the device
+        queue mid-pipeline.
+        """
+        if not self._pending_step_events:
+            return
+        pending, self._pending_step_events = self._pending_step_events, []
+        try:
+            torch.get_device_module().synchronize()
+            resolved = [start.elapsed_time(end) for start, end in pending]
+        except Exception as exc:
+            logger.warning(
+                "Could not resolve device step timings for request %s: %s",
+                self.request_id,
+                exc,
+            )
+            return
+        self.device_steps.extend(resolved)
+
     def record_stage_iterations(
         self, measured_iterations: int, target_iterations: int
     ) -> None:
@@ -112,6 +143,7 @@ class RequestMetrics:
             "request_id": self.request_id,
             "stages": self.stages,
             "steps": self.steps,
+            "device_steps": self.device_steps,
             "total_duration_ms": self.total_duration_ms,
             "memory_snapshots": {
                 name: snapshot.to_dict()
@@ -252,6 +284,8 @@ class RequestPerfRecord:
     steps: list[float]
     total_duration_ms: float
     memory_snapshots: dict[str, dict] = dataclasses.field(default_factory=dict)
+    # Either empty or index-aligned with `steps`; see RequestMetrics.device_steps.
+    device_steps: list[float] = dataclasses.field(default_factory=list)
 
     def __init__(
         self,
@@ -263,6 +297,7 @@ class RequestPerfRecord:
         total_duration_ms,
         memory_snapshots=None,
         timestamp=None,
+        device_steps=None,
     ):
         self.request_id = request_id
         if timestamp is not None:
@@ -276,6 +311,23 @@ class RequestPerfRecord:
         self.steps = steps
         self.total_duration_ms = total_duration_ms
         self.memory_snapshots = memory_snapshots or {}
+        self.device_steps = device_steps or []
+
+
+@lru_cache(maxsize=1)
+def _device_timing_events_supported() -> bool:
+    """Whether the active device module can create timing events."""
+    if current_platform.is_cpu():
+        return False
+    device_module = torch.get_device_module()
+    if not device_module.is_available():
+        return False
+    try:
+        device_module.Event(enable_timing=True)
+    except Exception as exc:
+        logger.debug("Device timing events unavailable: %s", exc)
+        return False
+    return True
 
 
 class StageProfiler:
@@ -301,9 +353,27 @@ class StageProfiler:
         self.log_stage_start_end = log_stage_start_end
         self.capture_memory = capture_memory
         self.record_as_step = record_as_step
+        self.start_event: Any = None
+        self.end_event: Any = None
 
     def _should_record_as_step(self) -> bool:
         return self.record_as_step or self.stage_name.startswith("denoising_step_")
+
+    def _maybe_start_device_timing(self) -> None:
+        # The host timer below measures submission, not execution; on a deep
+        # async queue (SYCL/Level-Zero) the two differ by 10-30x.
+        if not (self.log_timing and self.metrics and self._should_record_as_step()):
+            return
+        if not _device_timing_events_supported():
+            return
+        device_module = torch.get_device_module()
+        self.start_event = device_module.Event(enable_timing=True)
+        self.end_event = device_module.Event(enable_timing=True)
+        self.start_event.record()
+
+    def _maybe_end_device_timing(self) -> None:
+        if self.end_event is not None:
+            self.end_event.record()
 
     def _maybe_sync_device(self):
         """Drain the device queue when SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1.
@@ -337,6 +407,7 @@ class StageProfiler:
 
         if (self.log_timing and self.metrics) or self.log_stage_start_end:
             self._maybe_sync_device()
+            self._maybe_start_device_timing()
             self.start_time = time.perf_counter()
 
         return self
@@ -345,6 +416,7 @@ class StageProfiler:
         if not ((self.log_timing and self.metrics) or self.log_stage_start_end):
             return False
 
+        self._maybe_end_device_timing()
         self._maybe_sync_device()
         execution_time_s = time.perf_counter() - self.start_time
 
@@ -366,6 +438,10 @@ class StageProfiler:
         if self.log_timing and self.metrics:
             if self._should_record_as_step():
                 self.metrics.record_step(execution_time_s)
+                if self.end_event is not None:
+                    self.metrics.record_step_device_events(
+                        self.start_event, self.end_event
+                    )
             else:
                 self.metrics.record_stage(self.stage_name, execution_time_s)
 
@@ -405,8 +481,14 @@ class PerformanceLogger:
             for name, duration_ms in metrics.stages.items()
         ]
 
+        device_steps = metrics.device_steps
+        aligned_device = len(device_steps) == len(metrics.steps)
         denoise_steps_ms = [
-            {"step": idx, "duration_ms": duration_ms}
+            {
+                "step": idx,
+                "duration_ms": duration_ms,
+                "device_duration_ms": device_steps[idx] if aligned_device else None,
+            }
             for idx, duration_ms in enumerate(metrics.steps)
         ]
 
@@ -463,6 +545,7 @@ class PerformanceLogger:
             tag="pipeline_stage_metrics",
             stages=formatted_stages,
             steps=metrics.steps,
+            device_steps=metrics.device_steps,
             total_duration_ms=metrics.total_duration_ms,
             memory_snapshots=memory_checkpoints,
         )
